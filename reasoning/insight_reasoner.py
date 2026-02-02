@@ -158,6 +158,44 @@ Context:
 """
 
 
+def build_query_prompt(
+    *,
+    dataset_id: str,
+    version: str,
+    question: str,
+    compressed_schema_json: str,
+    compressed_analysis_result_json: Optional[str],
+    insight_summaries: Sequence[str],
+) -> str:
+    """
+    Query answering prompt.
+
+    The model must answer using only compressed schema + analysis + stored insights.
+    No new statistics may be computed.
+    """
+    payload = {
+        "dataset_id": dataset_id,
+        "version": version,
+        "question": question,
+        "schema": compressed_schema_json,
+        "analysis": compressed_analysis_result_json,
+        "insights": list(insight_summaries)[:80],
+    }
+    return f"""{SYSTEM_RULES}
+
+Task:
+Answer the user's question using ONLY the provided context.
+If the context is insufficient, say what is missing and suggest the minimum additional analysis needed.
+Do NOT compute new statistics or invent values.
+
+Return JSON in this shape:
+{{"answer":string,"used":["schema"|"analysis"|"insights"],"limitations":string}}
+
+Context (JSON):
+{json.dumps(payload, separators=(",", ":"), ensure_ascii=False)}
+"""
+
+
 # -----------------------------
 # Reasoner
 # -----------------------------
@@ -343,6 +381,38 @@ class InsightReasoner:
             insights.append(candidate)
 
         return insights
+
+    def answer_query(
+        self,
+        *,
+        dataset_id: str,
+        version: str,
+        question: str,
+        compressed_schema_json: str,
+        compressed_analysis_result_json: Optional[str],
+        insight_summaries: Sequence[str],
+    ) -> str:
+        """
+        Answer a natural-language question using only compressed stored context.
+
+        Returns:
+            A plain-text answer string (ready for API response / caching).
+        """
+        prompt = build_query_prompt(
+            dataset_id=dataset_id,
+            version=version,
+            question=question,
+            compressed_schema_json=compressed_schema_json,
+            compressed_analysis_result_json=compressed_analysis_result_json,
+            insight_summaries=insight_summaries,
+        )
+        raw = self.llm.complete(prompt=prompt, temperature=self.temperature)
+        parsed = self._parse_llm_json(raw)
+        ans = parsed.get("answer")
+        if isinstance(ans, str) and ans.strip():
+            return ans.strip()
+        # Fallback: return raw text to avoid total failure, still cacheable.
+        return (raw or "").strip()
 
     # -----------------------------
     # Internal parsing + dedup
