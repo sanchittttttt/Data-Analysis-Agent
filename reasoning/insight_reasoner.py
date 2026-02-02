@@ -206,9 +206,16 @@ class InsightReasoner:
     The AI reasoning layer.
 
     This class:
-    - performs a one-shot LLM synthesis call from compressed context
-    - assigns deterministic IDs + semantic hashes
-    - performs semantic dedup using embeddings (preferred) or a small LLM check
+    - Optionally compresses prompts using ScaleDown (for token efficiency)
+    - Performs a one-shot LLM synthesis call from compressed context via an LLM client (e.g., Ollama)
+    - Assigns deterministic IDs + semantic hashes
+    - Performs semantic dedup using embeddings (preferred) or a small LLM check
+    
+    Pipeline:
+    1. Build full reasoning prompt
+    2. (Optional) Compress prompt using ScaleDown client
+    3. Send compressed/full prompt to LLM client
+    4. Parse and deduplicate results
     """
 
     def __init__(
@@ -218,15 +225,34 @@ class InsightReasoner:
         max_new_insights: int = 8,
         temperature: float = 0.2,
         embedding_similarity_threshold: float = 0.88,
+        compression_client: Optional[Any] = None,
     ) -> None:
         self.llm = llm
         self.max_new_insights = int(max_new_insights)
         self.temperature = float(temperature)
         self.embedding_similarity_threshold = float(embedding_similarity_threshold)
+        self.compression_client = compression_client  # Optional ScaledownCompressionClient
 
     # -----------------------------
     # Deterministic helpers
     # -----------------------------
+
+    def _maybe_compress_prompt(self, prompt: str) -> str:
+        """
+        Optionally compress prompt using ScaleDown if client is available.
+        
+        If compression fails, returns original prompt (explicit fallback).
+        """
+        if not self.compression_client:
+            return prompt
+        
+        try:
+            compressed = self.compression_client.compress(prompt)
+            return compressed
+        except Exception as e:
+            # Log and fall back gracefully
+            print(f"Warning: Prompt compression failed ({e}), using original prompt")
+            return prompt
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -320,6 +346,12 @@ class InsightReasoner:
         """
         Produce synthesized insights via a single LLM call, then semantically deduplicate.
 
+        Pipeline:
+        1. Build full reasoning prompt
+        2. Compress prompt using ScaleDown (if available)
+        3. Send to LLM (e.g., Ollama)
+        4. Parse and deduplicate results
+
         Inputs are compressed JSON strings; this function does not parse/compute stats.
         """
         prompt = build_synthesis_prompt(
@@ -330,6 +362,9 @@ class InsightReasoner:
             existing_insight_summaries=existing_insight_summaries,
             max_new_insights=self.max_new_insights,
         )
+
+        # Optional compression: reduce token count before sending to LLM
+        prompt = self._maybe_compress_prompt(prompt)
 
         raw = self.llm.complete(prompt=prompt, temperature=self.temperature)
         parsed = self._parse_llm_json(raw)
@@ -395,6 +430,12 @@ class InsightReasoner:
         """
         Answer a natural-language question using only compressed stored context.
 
+        Pipeline:
+        1. Build full query prompt
+        2. Compress prompt using ScaleDown (if available)
+        3. Send to LLM (e.g., Ollama)
+        4. Parse and return answer
+
         Returns:
             A plain-text answer string (ready for API response / caching).
         """
@@ -406,6 +447,10 @@ class InsightReasoner:
             compressed_analysis_result_json=compressed_analysis_result_json,
             insight_summaries=insight_summaries,
         )
+
+        # Optional compression: reduce token count before sending to LLM
+        prompt = self._maybe_compress_prompt(prompt)
+
         raw = self.llm.complete(prompt=prompt, temperature=self.temperature)
         parsed = self._parse_llm_json(raw)
         ans = parsed.get("answer")
